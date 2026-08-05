@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate shell scripts
+        run: |
+          sh -n install.sh nurvnet scripts/*.sh tests/*.sh
+          shellcheck install.sh nurvnet scripts/*.sh tests/*.sh
+      - name: Validate PowerShell installer
+        shell: pwsh
+        run: '[scriptblock]::Create((Get-Content -Raw ./install.ps1)) | Out-Null'
+      - name: Render configuration
+        run: |
+          chmod +x nurvnet scripts/*.sh
+          ./nurvnet prepare
+          ! grep -R '__[A-Z_]*__' config/cliproxyapi.yaml .runtime/open-webui.env
+      - name: Validate Compose
+        run: docker compose config --quiet
+      - name: Build release artifacts
+        run: |
+          chmod +x scripts/package.sh
+          ./scripts/package.sh

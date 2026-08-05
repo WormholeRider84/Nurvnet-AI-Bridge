@@ -1,0 +1,250 @@
+#!/bin/sh
+set -eu
+
+ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+MANAGER_URL=https://github.com/router-for-me/Cli-Proxy-API-Management-Center/releases/download/v1.21.4/management.html
+MANAGER_SHA256=1d885552cc2d12b98613f31f2bc326e321c81dcbb792afb1e0b0066ecb74028e
+
+die() {
+  printf 'Nurvnet-AI-Bridge: %s\n' "$*" >&2
+  exit 1
+}
+
+compose() {
+  (cd "$ROOT" && docker compose "$@")
+}
+
+random_hex() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 32
+  else
+    dd if=/dev/urandom bs=32 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n'
+  fi
+}
+
+download() {
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$1" -o "$2"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO "$2" "$1"
+  else
+    die "curl or wget is required"
+  fi
+}
+
+sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{ print $1 }'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{ print $1 }'
+  else
+    die "sha256sum or shasum is required"
+  fi
+}
+
+ensure_manager() {
+  manager=$ROOT/data/cliproxyapi/static/management.html
+  if [ -f "$manager" ] && [ "$(sha256 "$manager")" = "$MANAGER_SHA256" ]; then
+    return
+  fi
+  temporary=$manager.tmp.$$
+  download "$MANAGER_URL" "$temporary"
+  [ "$(sha256 "$temporary")" = "$MANAGER_SHA256" ] || {
+    rm -f -- "$temporary"
+    die "management center checksum verification failed"
+  }
+  mv "$temporary" "$manager"
+}
+
+load_settings() {
+  WEBUI_PORT=3000
+  CLIPROXY_PORT=8317
+  if [ -f "$ROOT/.env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    . "$ROOT/.env"
+    set +a
+  fi
+  WEBUI_URL=http://localhost:$WEBUI_PORT
+  CLIPROXY_URL=http://localhost:$CLIPROXY_PORT
+}
+
+prepare() {
+  mkdir -p "$ROOT/.runtime" "$ROOT/config" \
+    "$ROOT/data/open-webui" "$ROOT/data/cliproxyapi/auths" \
+    "$ROOT/data/cliproxyapi/logs" "$ROOT/data/cliproxyapi/static"
+
+  [ -f "$ROOT/.env" ] || cp "$ROOT/.env.example" "$ROOT/.env"
+  load_settings
+
+  if [ ! -f "$ROOT/.runtime/secrets.env" ]; then
+    umask 077
+    api_key=$(random_hex)
+    management_key=$(random_hex)
+    webui_key=$(random_hex)
+    [ "${#api_key}" -eq 64 ] && [ "${#management_key}" -eq 64 ] && [ "${#webui_key}" -eq 64 ] || \
+      die "secure random key generation failed"
+    cat >"$ROOT/.runtime/secrets.env" <<EOF
+CLIPROXY_API_KEY=$api_key
+CLIPROXY_MANAGEMENT_KEY=$management_key
+WEBUI_SECRET_KEY=$webui_key
+EOF
+  fi
+
+  set -a
+  # shellcheck disable=SC1091
+  . "$ROOT/.runtime/secrets.env"
+  set +a
+
+  if [ ! -f "$ROOT/config/cliproxyapi.yaml" ]; then
+    sed \
+      -e "s/__CLIPROXY_API_KEY__/$CLIPROXY_API_KEY/g" \
+      -e "s/__CLIPROXY_MANAGEMENT_KEY__/$CLIPROXY_MANAGEMENT_KEY/g" \
+      "$ROOT/config/cliproxyapi.example.yaml" >"$ROOT/config/cliproxyapi.yaml"
+  fi
+
+  if [ ! -f "$ROOT/.runtime/open-webui.env" ]; then
+    sed \
+      -e "s|__WEBUI_URL__|$WEBUI_URL|g" \
+      -e "s/__WEBUI_SECRET_KEY__/$WEBUI_SECRET_KEY/g" \
+      -e "s/__CLIPROXY_API_KEY__/$CLIPROXY_API_KEY/g" \
+      "$ROOT/config/open-webui.env.example" >"$ROOT/.runtime/open-webui.env"
+  fi
+
+  chmod 600 "$ROOT/.env" "$ROOT/.runtime/secrets.env" \
+    "$ROOT/.runtime/open-webui.env" "$ROOT/config/cliproxyapi.yaml"
+  ensure_manager
+}
+
+require_docker() {
+  command -v docker >/dev/null 2>&1 || die "Docker is not installed: https://docs.docker.com/engine/install/"
+  docker compose version >/dev/null 2>&1 || die "Docker Compose v2 is required"
+  docker info >/dev/null 2>&1 || die "Docker is installed but its daemon is not running"
+}
+
+http_ok() {
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsS -o /dev/null "$1"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO /dev/null "$1"
+  else
+    die "curl or wget is required for readiness checks"
+  fi
+}
+
+wait_for() {
+  name=$1
+  url=$2
+  attempts=${3:-120}
+  while [ "$attempts" -gt 0 ]; do
+    if http_ok "$url"; then
+      printf '%s is ready.\n' "$name"
+      return 0
+    fi
+    attempts=$((attempts - 1))
+    sleep 2
+  done
+  printf '%s did not become ready. Recent logs:\n' "$name" >&2
+  compose logs --tail=100 >&2 || true
+  return 1
+}
+
+open_url() {
+  [ "${NURVNET_NO_OPEN:-0}" = 1 ] && return 0
+  if command -v open >/dev/null 2>&1; then
+    open "$1" >/dev/null 2>&1 || true
+  elif command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "$1" >/dev/null 2>&1 || true
+  elif command -v gio >/dev/null 2>&1; then
+    gio open "$1" >/dev/null 2>&1 || true
+  elif command -v powershell.exe >/dev/null 2>&1; then
+    powershell.exe -NoProfile -Command "Start-Process '$1'" >/dev/null 2>&1 || true
+  fi
+}
+
+print_urls() {
+  set -a
+  # shellcheck disable=SC1091
+  . "$ROOT/.runtime/secrets.env"
+  set +a
+  printf '\nNurvnet-AI-Bridge is ready.\n'
+  printf 'Workspace: %s\n' "$WEBUI_URL"
+  printf 'Provider setup: %s/management.html#/ai-providers\n' "$CLIPROXY_URL"
+  printf 'Management key: %s\n\n' "$CLIPROXY_MANAGEMENT_KEY"
+}
+
+start_stack() {
+  prepare
+  require_docker
+  compose up -d
+  wait_for CLIProxyAPI "$CLIPROXY_URL/healthz" 60
+  wait_for 'Open WebUI' "$WEBUI_URL/health" 180
+  print_urls
+}
+
+usage() {
+  cat <<'EOF'
+Usage: ./nurvnet COMMAND
+
+  install   Prepare, pull, start, and open the first-run setup
+  start     Start the stack and open the workspace
+  stop      Gracefully stop and remove the containers
+  restart   Restart the stack and wait for readiness
+  status    Show service status
+  logs      Follow service logs
+  open      Open the workspace
+  setup     Open provider settings and print the management key
+  prepare   Generate missing local configuration without starting Docker
+EOF
+}
+
+load_settings
+case ${1:-help} in
+  install)
+    prepare
+    require_docker
+    compose pull
+    start_stack
+    open_url "$WEBUI_URL"
+    open_url "$CLIPROXY_URL/management.html#/ai-providers"
+    ;;
+  start)
+    start_stack
+    open_url "$WEBUI_URL"
+    ;;
+  stop)
+    require_docker
+    compose down
+    ;;
+  restart)
+    prepare
+    require_docker
+    compose restart
+    wait_for CLIProxyAPI "$CLIPROXY_URL/healthz" 60
+    wait_for 'Open WebUI' "$WEBUI_URL/health" 180
+    print_urls
+    ;;
+  status)
+    require_docker
+    compose ps
+    ;;
+  logs)
+    require_docker
+    compose logs --tail=200 -f
+    ;;
+  open)
+    open_url "$WEBUI_URL"
+    printf '%s\n' "$WEBUI_URL"
+    ;;
+  setup)
+    prepare
+    print_urls
+    open_url "$CLIPROXY_URL/management.html#/ai-providers"
+    ;;
+  prepare)
+    prepare
+    printf 'Configuration is ready in %s\n' "$ROOT"
+    ;;
+  help|-h|--help) usage ;;
+  *) usage >&2; exit 2 ;;
+esac

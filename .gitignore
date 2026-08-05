@@ -1,0 +1,7 @@
+.env
+.runtime/
+config/cliproxyapi.yaml
+data/
+dist/
+*.log
+.DS_Store
