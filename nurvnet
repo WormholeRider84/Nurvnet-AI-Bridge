@@ -82,8 +82,9 @@ prepare() {
     api_key=$(random_hex)
     management_key=$(random_hex)
     webui_key=$(random_hex)
-    [ "${#api_key}" -eq 64 ] && [ "${#management_key}" -eq 64 ] && [ "${#webui_key}" -eq 64 ] || \
+    if [ "${#api_key}" -ne 64 ] || [ "${#management_key}" -ne 64 ] || [ "${#webui_key}" -ne 64 ]; then
       die "secure random key generation failed"
+    fi
     cat >"$ROOT/.runtime/secrets.env" <<EOF
 CLIPROXY_API_KEY=$api_key
 CLIPROXY_MANAGEMENT_KEY=$management_key
